@@ -1,0 +1,126 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: slo-burn-rate-alerts
+  namespace: monitoring
+  labels:
+    prometheus: kube-prometheus
+    role: alert-rules
+spec:
+  groups:
+    # ── Checkout Service SLO ────────────────────────────────────────────────
+    - name: checkout-availability-slo
+      interval: 30s
+      rules:
+        # Recording rules for multi-window burn rate
+        - record: slo:checkout_availability:ratio_rate5m
+          expr: >
+            sum(rate(http_requests_total{job="checkout",code!~"5.."}[5m]))
+            / sum(rate(http_requests_total{job="checkout"}[5m]))
+
+        - record: slo:checkout_availability:ratio_rate30m
+          expr: >
+            sum(rate(http_requests_total{job="checkout",code!~"5.."}[30m]))
+            / sum(rate(http_requests_total{job="checkout"}[30m]))
+
+        - record: slo:checkout_availability:ratio_rate1h
+          expr: >
+            sum(rate(http_requests_total{job="checkout",code!~"5.."}[1h]))
+            / sum(rate(http_requests_total{job="checkout"}[1h]))
+
+        - record: slo:checkout_availability:ratio_rate6h
+          expr: >
+            sum(rate(http_requests_total{job="checkout",code!~"5.."}[6h]))
+            / sum(rate(http_requests_total{job="checkout"}[6h]))
+
+        # Fast burn: 14.4× in 1h and 5m windows → PAGE (2% budget in 1h)
+        - alert: CheckoutAvailabilityFastBurn
+          expr: >
+            (1 - slo:checkout_availability:ratio_rate1h) > (14.4 * (1 - 0.999))
+            and
+            (1 - slo:checkout_availability:ratio_rate5m) > (14.4 * (1 - 0.999))
+          for: 2m
+          labels:
+            severity: critical
+            slo: checkout-availability
+            burn_rate: fast
+          annotations:
+            summary: "Checkout availability SLO fast burn rate"
+            description: >
+              Checkout is burning error budget at 14.4× the allowed rate.
+              At this rate, the entire 30-day budget will be exhausted in ~2 days.
+              Current 1h error rate: {{ printf "%.4f" (1 - $value) }}
+
+        # Slow burn: 6× in 6h and 30m windows → PAGE (5% budget in 6h)
+        - alert: CheckoutAvailabilitySlowBurn6h
+          expr: >
+            (1 - slo:checkout_availability:ratio_rate6h) > (6 * (1 - 0.999))
+            and
+            (1 - slo:checkout_availability:ratio_rate30m) > (6 * (1 - 0.999))
+          for: 15m
+          labels:
+            severity: warning
+            slo: checkout-availability
+            burn_rate: slow
+          annotations:
+            summary: "Checkout availability SLO slow burn (6h window)"
+            description: >
+              Checkout is burning error budget at 6× the allowed rate over 6 hours.
+              Current 6h error rate: {{ printf "%.4f" (1 - $value) }}
+
+    # ── Checkout Latency SLO ────────────────────────────────────────────────
+    - name: checkout-latency-slo
+      interval: 30s
+      rules:
+        - record: slo:checkout_latency_p99:ratio_rate5m
+          expr: >
+            sum(rate(http_request_duration_seconds_bucket{job="checkout",le="0.5"}[5m]))
+            / sum(rate(http_request_duration_seconds_count{job="checkout"}[5m]))
+
+        - record: slo:checkout_latency_p99:ratio_rate1h
+          expr: >
+            sum(rate(http_request_duration_seconds_bucket{job="checkout",le="0.5"}[1h]))
+            / sum(rate(http_request_duration_seconds_count{job="checkout"}[1h]))
+
+        - alert: CheckoutLatencyFastBurn
+          expr: >
+            (1 - slo:checkout_latency_p99:ratio_rate1h) > (14.4 * (1 - 0.99))
+            and
+            (1 - slo:checkout_latency_p99:ratio_rate5m) > (14.4 * (1 - 0.99))
+          for: 2m
+          labels:
+            severity: critical
+            slo: checkout-latency-p99
+            burn_rate: fast
+          annotations:
+            summary: "Checkout latency SLO fast burn"
+            description: >
+              More than 14.4× the allowed fraction of requests are exceeding the
+              500ms p99 latency target. Error budget exhausting rapidly.
+
+    # ── API Gateway SLO ─────────────────────────────────────────────────────
+    - name: api-gateway-availability-slo
+      interval: 30s
+      rules:
+        - record: slo:api_gateway_availability:ratio_rate5m
+          expr: >
+            sum(rate(nginx_http_requests_total{status!~"5.."}[5m]))
+            / sum(rate(nginx_http_requests_total[5m]))
+
+        - record: slo:api_gateway_availability:ratio_rate1h
+          expr: >
+            sum(rate(nginx_http_requests_total{status!~"5.."}[1h]))
+            / sum(rate(nginx_http_requests_total[1h]))
+
+        - alert: APIGatewayAvailabilityFastBurn
+          expr: >
+            (1 - slo:api_gateway_availability:ratio_rate1h) > (14.4 * (1 - 0.9995))
+            and
+            (1 - slo:api_gateway_availability:ratio_rate5m) > (14.4 * (1 - 0.9995))
+          for: 2m
+          labels:
+            severity: critical
+            slo: api-gateway-availability
+          annotations:
+            summary: "API Gateway availability SLO fast burn"
+            description: "API Gateway error budget burning at 14.4× rate"

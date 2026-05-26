@@ -1,0 +1,95 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: slo-manager
+  namespace: monitoring
+  labels:
+    app: slo-manager
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: slo-manager
+  template:
+    metadata:
+      labels:
+        app: slo-manager
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+    spec:
+      serviceAccountName: slo-manager
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: slo-manager
+          image: ghcr.io/ashiq-ali/k8s-slo-manager:latest
+          args:
+            - daemon
+            - --slo-file=/etc/slo-manager/slos.yaml
+            - --prometheus-url=$(PROMETHEUS_URL)
+            - --interval=60
+          env:
+            - name: PROMETHEUS_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: slo-manager-config
+                  key: prometheus_url
+            - name: SLACK_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: slo-manager-secrets
+                  key: slack_webhook_url
+                  optional: true
+            - name: PAGERDUTY_INTEGRATION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: slo-manager-secrets
+                  key: pagerduty_integration_key
+                  optional: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            - name: slo-config
+              mountPath: /etc/slo-manager
+              readOnly: true
+          livenessProbe:
+            exec:
+              command: ["python", "-c", "import slo_manager"]
+            initialDelaySeconds: 10
+            periodSeconds: 30
+      volumes:
+        - name: slo-config
+          configMap:
+            name: slo-manager-slos
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: slo-manager
+  namespace: monitoring
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: slo-manager-config
+  namespace: monitoring
+data:
+  prometheus_url: "http://prometheus-operated.monitoring.svc.cluster.local:9090"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: slo-manager-slos
+  namespace: monitoring
+data:
+  slos.yaml: |
+    # Mount your slos.yaml content here or use a separate ConfigMap
+    # See examples/slos.yaml for the full format
+    slos: []

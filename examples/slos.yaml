@@ -1,0 +1,73 @@
+slos:
+  # ── Availability SLO ─────────────────────────────────────────────────────
+  - name: checkout-availability
+    service: checkout
+    type: availability
+    description: "99.9% of checkout requests must succeed (non-5xx)"
+    target: 0.999        # 99.9%
+    window_days: 30
+    labels:
+      team: payments
+      tier: critical
+    # Good = non-5xx responses; Total = all requests
+    prometheus_good_query: >
+      sum(rate(http_requests_total{job="checkout",code!~"5.."}[5m]))
+      /
+      sum(rate(http_requests_total{job="checkout"}[5m]))
+    prometheus_total_query: >
+      sum(rate(http_requests_total{job="checkout"}[5m]))
+
+  # ── Latency SLO ──────────────────────────────────────────────────────────
+  - name: checkout-latency-p99
+    service: checkout
+    type: latency
+    description: "99% of checkout requests must complete in < 500ms (p99)"
+    target: 0.99         # 99%
+    window_days: 30
+    labels:
+      team: payments
+      tier: critical
+    latency_target:
+      threshold_ms: 500
+      percentile: 0.99
+    # Good = requests under 500ms; Total = all requests
+    prometheus_good_query: >
+      sum(rate(http_request_duration_seconds_bucket{job="checkout",le="0.5"}[5m]))
+      /
+      sum(rate(http_request_duration_seconds_count{job="checkout"}[5m]))
+    prometheus_total_query: >
+      sum(rate(http_request_duration_seconds_count{job="checkout"}[5m]))
+
+  # ── API Gateway availability ──────────────────────────────────────────────
+  - name: api-gateway-availability
+    service: api-gateway
+    type: availability
+    description: "99.95% of API gateway requests must succeed"
+    target: 0.9995
+    window_days: 30
+    labels:
+      team: platform
+      tier: critical
+    prometheus_good_query: >
+      sum(rate(nginx_http_requests_total{status!~"5.."}[5m]))
+      /
+      sum(rate(nginx_http_requests_total[5m]))
+    prometheus_total_query: >
+      sum(rate(nginx_http_requests_total[5m]))
+
+  # ── User service ─────────────────────────────────────────────────────────
+  - name: user-service-availability
+    service: user-service
+    type: availability
+    description: "99.5% of user service requests must succeed"
+    target: 0.995
+    window_days: 30
+    labels:
+      team: identity
+      tier: high
+    prometheus_good_query: >
+      sum(rate(grpc_server_handled_total{job="user-service",grpc_code="OK"}[5m]))
+      /
+      sum(rate(grpc_server_handled_total{job="user-service"}[5m]))
+    prometheus_total_query: >
+      sum(rate(grpc_server_handled_total{job="user-service"}[5m]))
