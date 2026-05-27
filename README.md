@@ -1,118 +1,373 @@
 # k8s-slo-manager
 
-> SLO tracking, error budget calculation, and burn-rate alerting for Kubernetes services — built on the Google SRE workbook model.
+> SLO tracking, error budget calculation, and burn-rate alerting for Kubernetes services — built on the Google SRE workbook model. Runs as an in-cluster daemon or standalone CLI.
 
 [![CI](https://github.com/ashiq-ali/k8s-slo-manager/actions/workflows/ci.yml/badge.svg)](https://github.com/ashiq-ali/k8s-slo-manager/actions)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python)](https://python.org)
+[![Prometheus](https://img.shields.io/badge/Prometheus-compatible-E6522C?logo=prometheus)](https://prometheus.io)
+
+---
 
 ## Architecture
 
+> 📐 **[Open in Excalidraw](docs/architecture.excalidraw)** — interactive diagram you can edit at [excalidraw.com](https://excalidraw.com)
+
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        k8s-slo-manager                          │
-│                                                                  │
-│  slos.yaml ──► Loader ──► SLOEvaluator ──► SLOStatus            │
-│                                │                                 │
-│                          PrometheusClient                        │
-│                          (instant + range queries)               │
-│                                │                                 │
-│                     BurnRateCalculator                           │
-│                     (fast/slow burn, 3 rule sets)                │
-│                                │                                 │
-│                    ┌───────────┴──────────┐                      │
-│                    │                      │                      │
-│               SlackAlerter         PagerDutyAlerter              │
-│                    │                      │                      │
-│              Reporter (MD/JSON)    PrometheusRule (YAML)         │
-└─────────────────────────────────────────────────────────────────┘
+  Kubernetes Services
+  ├── api-service  ──►  Prometheus (scrape)
+  ├── auth-service ──►      │
+  └── ml-service   ──►      │  PromQL queries
+                            ▼
+                     SLO Manager
+                     ├── evaluator.py   (good/total events ratio)
+                     ├── burn_rate.py   (fast: 2% in 1h / slow: 5% in 6h)
+                     └── reporter.py    (weekly Markdown/JSON report)
+                            │
+                ┌───────────┴──────────┐
+                ▼                      ▼
+          Grafana Dashboard      Slack / PagerDuty
+          (live error budget)    (burn-rate alerts)
 ```
 
-## Burn Rate Model (Google SRE Workbook)
+---
 
-| Alert | Burn Rate | Short Window | Long Window | Severity | Budget consumed |
-|-------|-----------|--------------|-------------|----------|-----------------|
-| Fast burn | **14.4×** | 1h | 5m | 🚨 PAGE | 2% in 1h |
-| Slow burn | **6×** | 6h | 30m | 🚨 PAGE | 5% in 6h |
-| Very slow | **3×** | 3d | 6h | 🎫 TICKET | 10% in 3d |
+## Table of Contents
 
-A **burn rate** of 1.0 means you consume exactly the budget over the SLO window. Alerts fire only when **both** windows exceed the threshold, eliminating transient-spike false positives.
+- [What are SLOs and why this tool](#what-are-slos)
+- [Quick Start (CLI)](#quick-start-cli)
+- [Deploy as In-Cluster Daemon](#deploy-as-in-cluster-daemon)
+- [Defining SLOs](#defining-slos)
+- [Burn Rate Alerts](#burn-rate-alerts)
+- [CLI Reference](#cli-reference)
+- [Grafana Dashboard](#grafana-dashboard)
+- [PrometheusRule Integration](#prometheusrule-integration)
+- [Configuration Reference](#configuration-reference)
+- [Extending SLO Types](#extending-slo-types)
+- [Troubleshooting](#troubleshooting)
 
-## Quickstart
+---
+
+## What are SLOs
+
+**SLI (Service Level Indicator)** — a quantitative measure of service behaviour. Example: _ratio of HTTP requests returning 2xx_.
+
+**SLO (Service Level Objective)** — a target for an SLI. Example: _99.9% of requests return 2xx over a 30-day window_.
+
+**Error Budget** — how much unreliability you're allowed. A 99.9% SLO gives you 43 minutes of downtime per month. Spend it wisely.
+
+**Burn Rate** — how fast you're spending the error budget. A burn rate of 1.0 means you'll exactly exhaust the budget by end of window. 14.4× means you'll exhaust it in 5% of the time (2 hours for a 30-day window).
+
+This tool implements the **multi-window burn-rate alert** from [Google's SRE Workbook Chapter 5](https://sre.google/workbook/alerting-on-slos/):
+
+| Alert | Window | Burn Rate | Budget consumed |
+|-------|--------|-----------|-----------------|
+| Page (fast) | 1h + 5m | ≥ 14.4× | 2% in 1h |
+| Page (slow) | 6h + 30m | ≥ 6× | 5% in 6h |
+| Ticket | 3d + 6h | ≥ 3× | 10% in 3d |
+| Warning | 3d + 6h | ≥ 1× | on track |
+
+---
+
+## Quick Start (CLI)
 
 ```bash
-pip install -e ".[dev]"
+# Install
+pip install k8s-slo-manager
+# or from source:
+git clone https://github.com/ashiq-ali/k8s-slo-manager
+cd k8s-slo-manager && pip install -e .
 
-# Check all SLOs
-slo status --slo-file examples/slos.yaml --prometheus-url http://localhost:9090
+# Point at Prometheus
+export PROMETHEUS_URL=http://localhost:9090  # or your cluster Prometheus
 
-# Generate Markdown report
-slo report --slo-file examples/slos.yaml --format markdown
+# Check SLO status
+slo status --config examples/slos.yaml
 
-# CI gate: exit non-zero if any SLO is breached
-slo check --slo-file examples/slos.yaml
+# Generate weekly error budget report
+slo report --config examples/slos.yaml --output report.md
 
-# Run as daemon with Slack alerts
-SLACK_WEBHOOK_URL=https://hooks.slack.com/... slo daemon --interval 60
+# Continuous monitoring (daemon mode)
+slo daemon --config examples/slos.yaml --interval 60
 ```
 
-## SLO Definition Format
+---
 
-```yaml
-# examples/slos.yaml
-slos:
-  - name: checkout-availability
-    service: checkout
-    type: availability       # availability | latency | error_rate | throughput
-    target: 0.999            # 99.9%
-    window_days: 30
-    prometheus_good_query: >
-      sum(rate(http_requests_total{job="checkout",code!~"5.."}[5m]))
-      / sum(rate(http_requests_total{job="checkout"}[5m]))
-    prometheus_total_query: >
-      sum(rate(http_requests_total{job="checkout"}[5m]))
-```
-
-## Deploy to Kubernetes
+## Deploy as In-Cluster Daemon
 
 ```bash
-# Apply daemon deployment
+# 1. Create ConfigMap with your SLO definitions
+kubectl create configmap slo-config \
+  --from-file=slos.yaml=examples/slos.yaml \
+  -n monitoring
+
+# 2. Set Slack/PagerDuty credentials
+kubectl create secret generic slo-alerts \
+  --from-literal=slack-webhook-url=https://hooks.slack.com/... \
+  --from-literal=pagerduty-routing-key=... \
+  -n monitoring
+
+# 3. Deploy
 kubectl apply -f k8s/deployment.yaml
 
-# Apply PrometheusRule (requires prometheus-operator)
-kubectl apply -f k8s/prometheusrule.yaml
-
-# Import Grafana dashboard
-# In Grafana: Dashboards → Import → Upload k8s/grafana-dashboard.json
+# 4. Verify
+kubectl logs -n monitoring deployment/slo-manager -f
 ```
+
+The daemon evaluates all SLOs every 60 seconds, fires alerts when burn thresholds are crossed, and exposes metrics on `:8080/metrics` for Prometheus to scrape.
+
+---
+
+## Defining SLOs
+
+SLOs are defined in a YAML file. See `examples/slos.yaml` for full examples.
+
+### Availability SLO
+
+```yaml
+slos:
+  - name: api-availability
+    description: "API service returns 2xx for 99.9% of requests"
+    service: api-service
+    window_days: 30
+    target: 0.999   # 99.9%
+
+    indicator:
+      type: ratio
+      good_query: |
+        sum(rate(http_requests_total{service="api-service",code=~"2.."}[5m]))
+      total_query: |
+        sum(rate(http_requests_total{service="api-service"}[5m]))
+```
+
+### Latency SLO
+
+```yaml
+  - name: api-latency-p99
+    description: "99th percentile latency under 500ms for 95% of requests"
+    service: api-service
+    window_days: 30
+    target: 0.95   # 95% of requests
+
+    indicator:
+      type: ratio
+      good_query: |
+        sum(rate(http_request_duration_seconds_bucket{
+          service="api-service",
+          le="0.5"
+        }[5m]))
+      total_query: |
+        sum(rate(http_request_duration_seconds_count{service="api-service"}[5m]))
+```
+
+### Throughput SLO
+
+```yaml
+  - name: ml-pipeline-success
+    description: "95% of ML pipeline runs complete successfully"
+    service: ml-pipeline
+    window_days: 7
+    target: 0.95
+
+    indicator:
+      type: ratio
+      good_query: |
+        sum(increase(pipeline_runs_total{status="success"}[5m]))
+      total_query: |
+        sum(increase(pipeline_runs_total[5m]))
+```
+
+---
+
+## Burn Rate Alerts
+
+When a burn-rate threshold is crossed, the alerter fires:
+
+**Slack (fast burn — page-worthy):**
+```
+🔴 CRITICAL: api-availability SLO burn rate alert
+Service: api-service
+Current burn rate: 18.3× (threshold: 14.4×)
+Error budget remaining: 43% (17 days left in window)
+At this rate, budget exhausted in: 1h 22m
+Runbook: https://wiki.company.com/slo/api-availability
+```
+
+**Slack (slow burn — ticket):**
+```
+🟡 WARNING: api-latency-p99 SLO budget consumption
+Service: api-service
+Current burn rate: 4.1× (threshold: 3×)
+Error budget remaining: 71%
+Estimated exhaustion: 8 days 14 hours
+```
+
+Configure alert destinations in `examples/slos.yaml`:
+```yaml
+alerting:
+  slack:
+    webhook_url: ${SLACK_WEBHOOK_URL}
+    channels:
+      critical: "#platform-oncall"
+      warning: "#platform-alerts"
+  pagerduty:
+    routing_key: ${PAGERDUTY_ROUTING_KEY}
+    severity_map:
+      fast_burn: critical
+      slow_burn: warning
+      ticket: info
+```
+
+---
 
 ## CLI Reference
 
-| Command | Description |
-|---------|-------------|
-| `slo status` | Table view of current SLI and error budget |
-| `slo report` | Full Markdown or JSON error budget report |
-| `slo check` | Exit non-zero if any SLO is breached (CI gate) |
-| `slo daemon` | Run continuously, evaluate and alert on interval |
+```
+slo status [--config PATH] [--service NAME] [--json]
+  Show current SLO compliance, error budget remaining, and burn rate
 
-## Environment Variables
+slo report [--config PATH] [--window DAYS] [--output PATH] [--format md|json]
+  Generate error budget report for the last N days
 
-| Variable | Description |
-|----------|-------------|
-| `PROMETHEUS_URL` | Prometheus endpoint (default: `http://localhost:9090`) |
-| `SLO_FILE` | Path to SLO YAML (default: `examples/slos.yaml`) |
-| `SLACK_WEBHOOK_URL` | Slack incoming webhook for alerts |
-| `PAGERDUTY_INTEGRATION_KEY` | PagerDuty Events v2 integration key |
+slo check [--config PATH] [--fail-on-breach]
+  Exit 1 if any SLO is breaching (useful in CI/CD gates)
 
-## Development
+slo daemon [--config PATH] [--interval SECONDS]
+  Run continuous evaluation loop
 
-```bash
-pip install -e ".[dev]"
-pytest                  # run tests with coverage
-ruff check .            # lint
-mypy slo_manager        # type check
+slo validate [--config PATH]
+  Validate SLO definitions and test PromQL queries
 ```
 
-## Tech Stack
+Example `slo status` output:
+```
+SLO Status Report  (2024-01-15 14:32 UTC)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SERVICE              TARGET  CURRENT  BUDGET LEFT  BURN    STATUS
+api-availability     99.90%  99.94%   87.3%        0.58×   ✅ OK
+api-latency-p99      95.00%  96.12%   115.2%       0.0×    ✅ OK
+ml-pipeline-success  95.00%  92.11%   0.0%         ∞       🔴 BREACHING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
 
-**Python · Prometheus · Kubernetes · Grafana · Slack · PagerDuty**
+---
+
+## Grafana Dashboard
+
+Import `k8s/grafana-dashboard.json` into Grafana. The dashboard shows:
+
+- **Error budget gauge** — how much budget remains per SLO (color-coded green/amber/red)
+- **Burn rate graph** — time-series of burn rate with alert threshold lines
+- **SLO compliance timeline** — was the target met at each point in the window?
+- **Top error sources** — breakdown of what's causing good-event failures
+
+```bash
+# Import via Grafana API
+curl -X POST http://grafana:3000/api/dashboards/import \
+  -H "Content-Type: application/json" \
+  -d @k8s/grafana-dashboard.json
+```
+
+---
+
+## PrometheusRule Integration
+
+`k8s/prometheusrule.yaml` creates Prometheus alerting rules for the multi-window burn rate model:
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: slo-burn-rate-alerts
+spec:
+  groups:
+    - name: slo.burn_rate
+      rules:
+        - alert: SloBurnRateFast
+          expr: |
+            (
+              slo:error_budget_burn_rate:1h > 14.4
+              and
+              slo:error_budget_burn_rate:5m > 14.4
+            )
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Fast burn rate detected for {{ $labels.slo }}"
+```
+
+Apply with:
+```bash
+kubectl apply -f k8s/prometheusrule.yaml
+```
+
+---
+
+## Configuration Reference
+
+| Environment Variable | Default | Description |
+|---------------------|---------|-------------|
+| `PROMETHEUS_URL` | `http://prometheus:9090` | Prometheus server URL |
+| `SLO_CONFIG_PATH` | `slos.yaml` | Path to SLO definitions |
+| `EVAL_INTERVAL_SECONDS` | `60` | How often to evaluate SLOs |
+| `SLACK_WEBHOOK_URL` | — | Slack incoming webhook URL |
+| `PAGERDUTY_ROUTING_KEY` | — | PagerDuty Events API v2 routing key |
+| `REPORT_SCHEDULE` | `0 9 * * 1` | Weekly report cron (Monday 9am) |
+| `LOG_LEVEL` | `INFO` | DEBUG / INFO / WARNING / ERROR |
+
+---
+
+## Extending SLO Types
+
+The `evaluator.py` base class is designed for extension:
+
+```python
+from slo_manager.evaluator import SLOEvaluator
+
+class CustomSLOEvaluator(SLOEvaluator):
+    def good_events(self, window_seconds: int) -> float:
+        # Query your custom data source
+        return my_custom_query(window_seconds)
+
+    def total_events(self, window_seconds: int) -> float:
+        return my_total_query(window_seconds)
+```
+
+Built-in evaluator types: `ratio`, `threshold`, `windowed_mean`
+
+---
+
+## Troubleshooting
+
+**`PromQL query returned no data`**
+
+Verify the query works directly in Prometheus:
+```bash
+curl 'http://prometheus:9090/api/v1/query' \
+  --data-urlencode 'query=sum(rate(http_requests_total[5m]))'
+```
+
+If it returns nothing, the metric may not exist or the label selectors are wrong.
+
+**Burn rate shows `inf` or `nan`**
+
+This means total events is zero — no traffic to the service. The burn rate is mathematically undefined. SLO Manager will show `N/A` rather than alerting.
+
+**Error budget shows > 100%**
+
+This is correct and expected — it means the SLI is performing _better_ than the target. A budget of 115% means you have a 15% surplus.
+
+**Alert fired but Slack message not received**
+
+```bash
+kubectl logs -n monitoring deployment/slo-manager | grep -i slack
+# Test the webhook manually:
+curl -X POST $SLACK_WEBHOOK_URL \
+  -H 'Content-type: application/json' \
+  --data '{"text":"SLO Manager webhook test"}'
+```
+
+---
+
+*Built to demonstrate the Google SRE workbook burn-rate model, from hands-on SLO/SLI work at Amadeus where availability SLOs governed production airline booking systems.*
